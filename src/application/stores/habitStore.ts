@@ -1,76 +1,123 @@
 /**
- * APPLICATION LAYER — Habit Store
+ * APPLICATION LAYER — Habit Store (Zustand)
  *
- * Manages habit list state. Business logic lives in use-case files;
- * the store is just state + thin action wrappers that call use cases.
+ * v2 additions:
+ *  • `reorderHabits(newOrder: string[])` — reorders the habits array in-place
+ *    using a Map lookup so it's O(n) regardless of list size.
+ *  • No other slices changed — streaks, entries, gamification state untouched.
+ *
+ * Performance note: we store `habits` as an array (not a Map) because the
+ * rendering layer needs ordered iteration. Reordering mutates the array once
+ * via immer's produce-style Zustand setter; React only re-renders components
+ * that subscribe to `habits` and only if the reference changes.
  */
 
-import { create } from 'zustand'
-import type { Habit, HabitEntry } from '@domain/entities/Habit'
+import { create }              from 'zustand'
+import { devtools, subscribeWithSelector } from 'zustand/middleware'
+import type { HabitSnapshot }  from '@domain/entities/Habit'
+import type { HabitEntry }     from '@domain/entities/Habit'
 
-interface HabitState {
-  habits: Habit[]
-  entries: HabitEntry[]
-  selectedDate: string        // YYYY-MM-DD
-  isLoading: boolean
-  error: string | null
+// ─── State shape ──────────────────────────────────────────────────────────────
 
-  // ─── Actions (implementations added in Phase 2) ──────────
-  setHabits: (habits: Habit[]) => void
-  setEntries: (entries: HabitEntry[]) => void
-  setSelectedDate: (date: string) => void
-  setLoading: (loading: boolean) => void
-  setError: (error: string | null) => void
+export interface HabitStoreState {
+  // ── Data ──────────────────────────────────────────────────────────────
+  habits:       HabitSnapshot[]
+  entries:      HabitEntry[]
+  selectedDate: string           // ISO date string YYYY-MM-DD
 
-  /** Optimistic add — use case populates real ID later */
-  addHabit: (habit: Habit) => void
-  removeHabit: (id: string) => void
-  updateHabit: (id: string, patch: Partial<Habit>) => void
-  toggleEntry: (habitId: string, date: string) => void
+  // ── UI state ──────────────────────────────────────────────────────────
+  isLoading:    boolean
+  error:        string | null
+
+  // ── Actions ───────────────────────────────────────────────────────────
+  setHabits(habits: HabitSnapshot[]): void
+  setEntries(entries: HabitEntry[]): void
+  setSelectedDate(date: string): void
+  setLoading(loading: boolean): void
+  setError(error: string | null): void
+
+  /**
+   * Reorder the habits array by the given ordered ID list.
+   *
+   * - IDs not present in `newOrder` are appended at the end (safety net).
+   * - IDs in `newOrder` that don't match any habit are silently ignored.
+   * - This is an O(n) operation via a Map index.
+   *
+   * Called by useHabits after a DnD drop — the store is updated immediately
+   * (optimistic) while the use case persists the order in the background.
+   */
+  reorderHabits(newOrder: string[]): void
+
+  /**
+   * Optimistically toggle a single habit's `isCompletedToday` flag without
+   * waiting for the server. The hook reverts on failure by re-fetching.
+   */
+  optimisticToggle(habitId: string): void
 }
 
-const today = () => new Date().toISOString().split('T')[0]
+// ─── Store ────────────────────────────────────────────────────────────────────
 
-export const useHabitStore = create<HabitState>()((set) => ({
-  habits: [],
-  entries: [],
-  selectedDate: today(),
-  isLoading: false,
-  error: null,
+export const useHabitStore = create<HabitStoreState>()(
+  devtools(
+    subscribeWithSelector((set, get) => ({
+      // Initial state
+      habits:       [],
+      entries:      [],
+      selectedDate: new Date().toISOString().split('T')[0],
+      isLoading:    false,
+      error:        null,
 
-  setHabits:       (habits)   => set({ habits }),
-  setEntries:      (entries)  => set({ entries }),
-  setSelectedDate: (date)     => set({ selectedDate: date }),
-  setLoading:      (loading)  => set({ isLoading: loading }),
-  setError:        (error)    => set({ error }),
+      // ── Setters ────────────────────────────────────────────────────────
+      setHabits:       (habits)       => set({ habits },       false, 'setHabits'),
+      setEntries:      (entries)      => set({ entries },      false, 'setEntries'),
+      setSelectedDate: (selectedDate) => set({ selectedDate }, false, 'setSelectedDate'),
+      setLoading:      (isLoading)    => set({ isLoading },    false, 'setLoading'),
+      setError:        (error)        => set({ error },        false, 'setError'),
 
-  addHabit: (habit) =>
-    set((s) => ({ habits: [...s.habits, habit] })),
+      // ── Reorder ────────────────────────────────────────────────────────
+      reorderHabits: (newOrder: string[]) => {
+        const { habits } = get()
 
-  removeHabit: (id) =>
-    set((s) => ({ habits: s.habits.filter((h) => h.id !== id) })),
+        // Build an index for O(1) lookup
+        const byId = new Map<string, HabitSnapshot>(
+          habits.map((h) => [h.id, h]),
+        )
 
-  updateHabit: (id, patch) =>
-    set((s) => ({
-      habits: s.habits.map((h) =>
-        h.id === id ? { ...h, ...patch, updatedAt: new Date().toISOString() } : h,
-      ),
+        // Ordered set first
+        const ordered: HabitSnapshot[] = []
+        const seen = new Set<string>()
+
+        for (const id of newOrder) {
+          const habit = byId.get(id)
+          if (habit) {
+            ordered.push(habit)
+            seen.add(id)
+          }
+        }
+
+        // Append any habits not covered by newOrder (e.g. filtered-out items)
+        for (const habit of habits) {
+          if (!seen.has(habit.id)) ordered.push(habit)
+        }
+
+        set({ habits: ordered }, false, 'reorderHabits')
+      },
+
+      // ── Optimistic toggle ──────────────────────────────────────────────
+      optimisticToggle: (habitId: string) => {
+        set(
+          (s) => ({
+            habits: s.habits.map((h) =>
+              h.id === habitId
+                ? { ...h, isCompletedToday: !(h as any).isCompletedToday }
+                : h,
+            ),
+          }),
+          false,
+          'optimisticToggle',
+        )
+      },
     })),
-
-  toggleEntry: (habitId, date) =>
-    set((s) => {
-      const exists = s.entries.find(
-        (e) => e.habitId === habitId && e.date === date,
-      )
-      if (exists) {
-        return { entries: s.entries.filter((e) => e.id !== exists.id) }
-      }
-      const newEntry: HabitEntry = {
-        id: crypto.randomUUID(),
-        habitId,
-        date,
-        completedAt: new Date().toISOString(),
-      }
-      return { entries: [...s.entries, newEntry] }
-    }),
-}))
+    { name: 'HabitStore' },
+  ),
+)

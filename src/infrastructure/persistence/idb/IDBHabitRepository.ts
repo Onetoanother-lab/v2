@@ -1,28 +1,11 @@
 /**
  * INFRASTRUCTURE — IndexedDB Habit Repository
  *
- * Implements IHabitRepository using IndexedDB as the backing store.
- *
- * ─── DIP in action ────────────────────────────────────────────────────────────
- * The domain layer defined the interface (IHabitRepository).
- * This file implements it. No domain or application code was changed.
- * The container wires this in at startup — use cases never know the difference.
- *
- * ─── Record ↔ Snapshot mapping ────────────────────────────────────────────────
- * HabitSnapshot (domain) ──► toRecord() ──► HabitRecord (stored in IDB)
- * HabitRecord    (IDB)   ──► toSnapshot() ──► HabitSnapshot ──► Habit.fromSnapshot()
- *
- * The extra fields (nameLower, isArchived as 0|1) are stripped on read-out
- * so the domain never sees them.
- *
- * ─── Query patterns and their index usage ─────────────────────────────────────
- * getAll()                → BY_IS_ARCHIVED index, range only(0), sorted in JS
- * getAllIncludingArchived()→ full store scan, sorted in JS by createdAt
- * getById()               → primary key direct lookup  O(log n)
- * save()                  → put (insert)               O(log n)
- * update()                → put (overwrite)            O(log n)
- * delete()                → delete by key              O(log n)
- * existsByName()          → BY_NAME_LOWER index count  O(log n)
+ * v2 changes:
+ *   • getAll() and getAllIncludingArchived() now sort by `order ASC`
+ *     (fallback: createdAt ASC for records without an order value).
+ *   • reorderHabits() batch-updates the `order` field in a single
+ *     readwrite transaction without touching any other data.
  */
 
 import type { Habit }                   from '@/domain/entities/Habit'
@@ -41,10 +24,6 @@ import type { HabitRecord }             from './IDBSchema'
 
 // ─── Mapping helpers ──────────────────────────────────────────────────────────
 
-/**
- * Convert a domain HabitSnapshot to the IDB-storable HabitRecord.
- * Adds computed fields that support indexed queries.
- */
 function toRecord(snapshot: HabitSnapshot): HabitRecord {
   return {
     id:                         snapshot.id,
@@ -53,20 +32,19 @@ function toRecord(snapshot: HabitSnapshot): HabitRecord {
     description:                snapshot.description,
     category:                   snapshot.category,
     frequency:                  snapshot.frequency,
-    customDays:                 [...snapshot.customDays],   // ReadonlyArray → mutable for IDB
+    customDays:                 [...snapshot.customDays],
     color:                      snapshot.color,
     icon:                       snapshot.icon,
     targetCompletionsPerPeriod: snapshot.targetCompletionsPerPeriod,
     createdAt:                  snapshot.createdAt,
     updatedAt:                  snapshot.updatedAt,
     isArchived:                 snapshot.isArchived ? 1 : 0,
+    // Preserve existing order if snapshot carries it; undefined is fine —
+    // getAll() handles missing order via fallback sort.
+    order:                      (snapshot as any).order,
   }
 }
 
-/**
- * Convert a stored HabitRecord back to a HabitSnapshot for the domain.
- * Strips IDB-specific fields (nameLower, boolean coercion).
- */
 function toSnapshot(record: HabitRecord): HabitSnapshot {
   return {
     id:                         record.id as HabitId,
@@ -81,27 +59,38 @@ function toSnapshot(record: HabitRecord): HabitSnapshot {
     createdAt:                  record.createdAt,
     updatedAt:                  record.updatedAt,
     isArchived:                 record.isArchived === 1,
-  }
+    // Surface order so the hook can use it without a second fetch
+    order:                      record.order,
+  } as HabitSnapshot & { order?: number }
 }
 
-// ─── Repository implementation ────────────────────────────────────────────────
+// ─── Sort helper ──────────────────────────────────────────────────────────────
+
+/**
+ * Sort records by user-defined order, falling back to creation timestamp.
+ * Records whose `order` is undefined (pre-migration rows) sort to the end,
+ * then by createdAt so the list remains stable.
+ */
+function byOrder(a: HabitRecord, b: HabitRecord): number {
+  const aOrd = a.order ?? Number.MAX_SAFE_INTEGER
+  const bOrd = b.order ?? Number.MAX_SAFE_INTEGER
+  if (aOrd !== bOrd) return aOrd - bOrd
+  return a.createdAt.localeCompare(b.createdAt)
+}
+
+// ─── Repository ───────────────────────────────────────────────────────────────
 
 export class IDBHabitRepository implements IHabitRepository {
-  // All methods are standalone and stateless — the client manages the connection
 
   async getAll(): Promise<Habit[]> {
-    const tx     = idbClient.transaction(STORES.HABITS, 'readonly')
-    const store  = tx.objectStore(STORES.HABITS)
-    const index  = store.index(HABIT_INDEXES.BY_IS_ARCHIVED)
+    const tx    = idbClient.transaction(STORES.HABITS, 'readonly')
+    const store = tx.objectStore(STORES.HABITS)
+    const index = store.index(HABIT_INDEXES.BY_IS_ARCHIVED)
 
-    // IDBKeyRange.only(0) fetches only active (non-archived) habits
-    const records = await IDBClient.getAll<HabitRecord>(
-      index,
-      IDBKeyRange.only(0),
-    )
+    const records = await IDBClient.getAll<HabitRecord>(index, IDBKeyRange.only(0))
 
     return records
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .sort(byOrder)
       .map((r) => Habit.fromSnapshot(toSnapshot(r)))
   }
 
@@ -112,22 +101,31 @@ export class IDBHabitRepository implements IHabitRepository {
     const records = await IDBClient.getAll<HabitRecord>(store)
 
     return records
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .sort(byOrder)
       .map((r) => Habit.fromSnapshot(toSnapshot(r)))
   }
 
   async getById(id: HabitId): Promise<Habit | null> {
-    const tx     = idbClient.transaction(STORES.HABITS, 'readonly')
-    const store  = tx.objectStore(STORES.HABITS)
+    const tx    = idbClient.transaction(STORES.HABITS, 'readonly')
+    const store = tx.objectStore(STORES.HABITS)
     const record = await IDBClient.get<HabitRecord>(store, id)
 
     return record ? Habit.fromSnapshot(toSnapshot(record)) : null
   }
 
   async save(habit: Habit): Promise<void> {
+    // Assign order = current count so new habits appear at the end
+    const existing = await this.getAll()
+
     await idbClient.readwrite(STORES.HABITS, async (tx) => {
       const store = tx.objectStore(STORES.HABITS)
-      await IDBClient.put(store, toRecord(habit.toSnapshot()))
+      const snapshot = habit.toSnapshot()
+      const record = toRecord(snapshot)
+      // Only assign order if not already set
+      if (record.order === undefined) {
+        record.order = existing.length
+      }
+      await IDBClient.put(store, record)
     })
   }
 
@@ -140,7 +138,12 @@ export class IDBHabitRepository implements IHabitRepository {
         throw new Error(`[IDBHabitRepository] update failed — habit "${habit.id}" not found.`)
       }
 
-      await IDBClient.put(store, toRecord(habit.toSnapshot()))
+      // Preserve the existing order value through any update operation
+      const snapshot = habit.toSnapshot()
+      const record = toRecord(snapshot)
+      record.order = exists.order   // never overwrite order via a regular update
+
+      await IDBClient.put(store, record)
     })
   }
 
@@ -153,17 +156,43 @@ export class IDBHabitRepository implements IHabitRepository {
 
   async existsByName(name: string): Promise<boolean> {
     const normalized = name.trim().toLowerCase()
-    const tx         = idbClient.transaction(STORES.HABITS, 'readonly')
-    const store      = tx.objectStore(STORES.HABITS)
-    const index      = store.index(HABIT_INDEXES.BY_NAME_LOWER)
+    const tx    = idbClient.transaction(STORES.HABITS, 'readonly')
+    const store = tx.objectStore(STORES.HABITS)
+    const index = store.index(HABIT_INDEXES.BY_NAME_LOWER)
 
-    // Fetch all records with this exact lowercased name
     const records = await IDBClient.getAll<HabitRecord>(
       index,
       IDBKeyRange.only(normalized),
     )
 
-    // Only active (non-archived) habits count as duplicates
     return records.some((r) => r.isArchived === 0)
+  }
+
+  /**
+   * Batch-update the `order` field for a set of habits.
+   *
+   * Runs inside a single readwrite transaction for atomicity.
+   * Only touches the `order` field — every other field (name, streak
+   * data, entries, gamification) is read from the existing record and
+   * written back unchanged.
+   */
+  async reorderHabits(
+    updates: ReadonlyArray<{ habitId: HabitId; order: number }>,
+  ): Promise<void> {
+    if (updates.length === 0) return
+
+    await idbClient.readwrite(STORES.HABITS, async (tx) => {
+      const store = tx.objectStore(STORES.HABITS)
+
+      // Fetch + update each record sequentially within the transaction.
+      // IDB transactions stay open as long as we keep making requests,
+      // so chaining awaits here is safe.
+      for (const { habitId, order } of updates) {
+        const record = await IDBClient.get<HabitRecord>(store, habitId)
+        if (record) {
+          await IDBClient.put(store, { ...record, order })
+        }
+      }
+    })
   }
 }

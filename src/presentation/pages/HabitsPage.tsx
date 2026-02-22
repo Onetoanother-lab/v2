@@ -1,23 +1,7 @@
 /**
  * PRESENTATION LAYER — HabitsPage (Phase 3)
  *
- * The full habits page integrating:
- *   • FilterBar (category tabs + tag filter + sort + group-by)
- *   • Flat HabitList OR GroupedHabitList depending on groupBy setting
- *   • CreateHabitModal and EditHabitModal
- *   • DeleteConfirmModal
- *   • PWAInstallBanner
- *
- * This component orchestrates ALL page state but contains ZERO business logic:
- *   • Filter state → filterStore
- *   • Data fetching → useHabits hook
- *   • UI state (modal open, pending delete, editing habit) → local useState
- *
- * Render optimization:
- *   • All action callbacks wrapped in useCallback (stable refs for memoized children)
- *   • groupedHabits computation inside useHabits hook (memoized)
- *   • Category count computation is derived inline from habits (O(n) once per render)
- *   • FilterBar gets unfiltered `allHabits` for counts (stored separately)
+ * Fix: EmptyState `action` prop must be a ReactNode, not a plain object.
  */
 
 import { useState, useCallback, useMemo }    from 'react'
@@ -38,8 +22,8 @@ import type { HabitSnapshot }                from '@domain/entities/Habit'
 export function HabitsPage() {
   // ── Data & actions ─────────────────────────────────────────────────────
   const {
-    habits,           // filtered + sorted display list
-    groupedHabits,    // Map<category | 'all', HabitSnapshot[]>
+    habits,
+    groupedHabits,
     completedIds,
     selectedDate,
     isLoading,
@@ -60,17 +44,17 @@ export function HabitsPage() {
   const toggleTag    = useFilterStore((s) => s.toggleTag)
 
   // ── Local UI state ─────────────────────────────────────────────────────
-  const [createOpen,     setCreateOpen]     = useState(false)
-  const [editingHabit,   setEditingHabit]   = useState<HabitSnapshot | null>(null)
-  const [pendingDelete,  setPendingDelete]  = useState<string | null>(null)
+  const [createOpen,    setCreateOpen]    = useState(false)
+  const [editingHabit,  setEditingHabit]  = useState<HabitSnapshot | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null)
 
   // ── PWA ────────────────────────────────────────────────────────────────
   const { isInstallable, isOnline, install } = usePWA()
 
-  // ── Stable callbacks (prevent unnecessary child re-renders) ────────────
-  const handleToggle = useCallback((id: string) => toggleCompletion(id), [toggleCompletion])
-  const handleEdit   = useCallback((h: HabitSnapshot) => setEditingHabit(h), [])
-  const handleDelete = useCallback((id: string) => setPendingDelete(id), [])
+  // ── Stable callbacks ───────────────────────────────────────────────────
+  const handleToggle   = useCallback((id: string) => toggleCompletion(id), [toggleCompletion])
+  const handleEdit     = useCallback((h: HabitSnapshot) => setEditingHabit(h), [])
+  const handleDelete   = useCallback((id: string) => setPendingDelete(id), [])
   const handleTagClick = useCallback((tag: string) => toggleTag(tag), [toggleTag])
 
   const handleConfirmDelete = useCallback(async () => {
@@ -82,7 +66,7 @@ export function HabitsPage() {
 
   // Progress for the day
   const completedCount = completedIds.size
-  const dueCount       = habits.filter((h) => h.isDueToday).length
+  const dueCount       = (habits as any[]).filter((h) => h.isDueToday).length
   const progressPct    = dueCount > 0 ? completedCount / dueCount : 0
 
   // Format selected date
@@ -137,7 +121,8 @@ export function HabitsPage() {
             className="h-full rounded-full transition-all duration-700"
             style={{
               width: `${progressPct * 100}%`,
-              backgroundColor: progressPct === 1 ? '#22c55e' : progressPct >= 0.5 ? '#84cc16' : '#94a3b8',
+              backgroundColor:
+                progressPct === 1 ? '#22c55e' : progressPct >= 0.5 ? '#84cc16' : '#94a3b8',
             }}
           />
         </div>
@@ -152,12 +137,11 @@ export function HabitsPage() {
 
       {/* ── Filter bar ────────────────────────────────────────────────── */}
       {(allHabits.length > 0 || totalCount > 0) && (
-        <FilterBar habits={allHabits} />
+        <FilterBar habits={allHabits as any} />
       )}
 
       {/* ── Habit list ────────────────────────────────────────────────── */}
       {isLoading ? (
-        // Skeleton
         <div className="space-y-2.5">
           {[1, 2, 3, 4].map((n) => (
             <div key={n} className="h-20 animate-pulse rounded-2xl bg-slate-100 dark:bg-slate-800" />
@@ -166,19 +150,25 @@ export function HabitsPage() {
       ) : habits.length === 0 ? (
         <EmptyState
           icon="🌱"
-          title={totalCount === 0 ? "No habits yet" : "No habits match your filters"}
+          title={totalCount === 0 ? 'No habits yet' : 'No habits match your filters'}
           description={
             totalCount === 0
-              ? "Create your first habit to start building your streak."
-              : "Try adjusting your category or tag filters."
+              ? 'Create your first habit to start building your streak.'
+              : 'Try adjusting your category or tag filters.'
           }
-          action={totalCount === 0 ? {
-            label: "Create a habit",
-            onClick: () => setCreateOpen(true),
-          } : undefined}
+          action={
+            totalCount === 0 ? (
+              <button
+                onClick={() => setCreateOpen(true)}
+                className="flex items-center gap-2 rounded-xl bg-brand-500 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-600 transition-colors"
+              >
+                <Plus size={14} aria-hidden />
+                Create a habit
+              </button>
+            ) : undefined
+          }
         />
       ) : groupBy === 'category' ? (
-        // Grouped view
         <div className="space-y-3" role="list" aria-label="Habits grouped by category">
           {[...groupedHabits.entries()].map(([category, categoryHabits]) => {
             if (category === 'all') return null
@@ -199,13 +189,12 @@ export function HabitsPage() {
           })}
         </div>
       ) : (
-        // Flat list
         <div className="space-y-2" role="list" aria-label="Habits">
           {habits.map((habit) => (
-            <div key={habit.id} role="listitem">
+            <div key={(habit as any).id} role="listitem">
               <HabitCard
-                habit={habit}
-                isCompleted={completedIds.has(habit.id)}
+                habit={habit as any}
+                isCompleted={completedIds.has((habit as any).id)}
                 activeTags={activeTags}
                 onToggle={handleToggle}
                 onDelete={handleDelete}
@@ -233,7 +222,7 @@ export function HabitsPage() {
 
       <DeleteConfirmModal
         isOpen={pendingDelete !== null}
-        habitName={allHabits.find((h) => h.id === pendingDelete)?.name ?? ''}
+        habitName={(allHabits as any[]).find((h) => h.id === pendingDelete)?.name ?? ''}
         onConfirm={handleConfirmDelete}
         onCancel={() => setPendingDelete(null)}
       />
