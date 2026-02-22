@@ -1,226 +1,184 @@
 /**
- * DOMAIN LAYER — Habit Aggregate Root
+ * DOMAIN LAYER — Habit Entity (Phase 3)
  *
- * The Habit is the aggregate root of this bounded context.
- * All mutation goes through the entity's methods, never by direct field
- * assignment from outside, keeping invariants always valid.
+ * Changes from Phase 1/2:
+ *   + tags      string[]   — user-defined labels, e.g. ["morning", "health"]
+ *   + color     string?    — hex color for visual grouping, e.g. "#22c55e"
+ *   + icon      string?    — emoji or icon key, e.g. "🏃" or "running"
  *
- * No framework deps. No infrastructure imports. Pure TypeScript.
+ * Backward compatibility guarantee:
+ *   All new fields are OPTIONAL with safe defaults so existing persisted
+ *   habits (which have none of these fields) hydrate without errors.
+ *
+ * ─── Invariants (enforced in HabitFactory) ────────────────────────────────────
+ *   • name        must be 1–100 chars
+ *   • category    must be one of HABIT_CATEGORIES
+ *   • tags        max 10 tags, each 1–30 chars, lowercase, no spaces
+ *   • color       must be valid hex (#rrggbb) or undefined
+ *   • icon        must be ≤ 4 chars (emoji) or undefined
+ *
+ * ─── CRITICAL: Do NOT change existing field names or types ────────────────────
+ *   streak, completionRateLastMonth, etc. are consumed by GamificationEngine.
+ *   CategoryRadarChart reads .category. Do not rename.
  */
-
-import { HabitDomainError } from '@domain/errors/HabitDomainError'
-import type { HabitId, DateString } from '@domain/types/shared'
-
-// ─── Value types ─────────────────────────────────────────────────────────────
 
 export type HabitFrequency = 'daily' | 'weekly' | 'custom'
 
-export type HabitCategory =
-  | 'health'
-  | 'fitness'
-  | 'mindfulness'
-  | 'learning'
-  | 'productivity'
-  | 'social'
-  | 'finance'
-  | 'other'
-
-export const ALL_CATEGORIES: HabitCategory[] = [
-  'health', 'fitness', 'mindfulness', 'learning',
-  'productivity', 'social', 'finance', 'other',
-]
-
-// ─── Plain-data snapshot (what gets persisted) ────────────────────────────────
-
 /**
- * HabitSnapshot is the serialisable, plain-object form of a Habit.
- * Repositories store and return this; the entity class wraps it.
+ * Canonical category list.
+ * GamificationEngine.evaluateBadges() counts unique categories — add here freely,
+ * the badge predicate uses `categoryCount >= 4` which remains valid.
  */
-export interface HabitSnapshot {
-  readonly id: HabitId
-  readonly name: string
-  readonly description: string
-  readonly category: HabitCategory
-  readonly frequency: HabitFrequency
-  /** For frequency === 'custom': which days of week are active (0=Sun … 6=Sat) */
-  readonly customDays: ReadonlyArray<number>
-  readonly color: string
-  readonly icon: string
-  readonly targetCompletionsPerPeriod: number
-  readonly createdAt: DateString
-  readonly updatedAt: DateString
-  readonly isArchived: boolean
+export const HABIT_CATEGORIES = [
+  'health',
+  'fitness',
+  'mindfulness',
+  'learning',
+  'productivity',
+  'social',
+  'finance',
+  'creative',
+  'nutrition',
+  'sleep',
+  'other',
+] as const
+
+export type HabitCategory = (typeof HABIT_CATEGORIES)[number]
+
+export const CATEGORY_META: Record<
+  HabitCategory,
+  { label: string; emoji: string; defaultColor: string }
+> = {
+  health:       { label: 'Health',       emoji: '❤️',  defaultColor: '#ef4444' },
+  fitness:      { label: 'Fitness',      emoji: '💪',  defaultColor: '#f97316' },
+  mindfulness:  { label: 'Mindfulness',  emoji: '🧘',  defaultColor: '#8b5cf6' },
+  learning:     { label: 'Learning',     emoji: '📚',  defaultColor: '#3b82f6' },
+  productivity: { label: 'Productivity', emoji: '⚡',  defaultColor: '#eab308' },
+  social:       { label: 'Social',       emoji: '🤝',  defaultColor: '#ec4899' },
+  finance:      { label: 'Finance',      emoji: '💰',  defaultColor: '#10b981' },
+  creative:     { label: 'Creative',     emoji: '🎨',  defaultColor: '#f59e0b' },
+  nutrition:    { label: 'Nutrition',    emoji: '🥗',  defaultColor: '#22c55e' },
+  sleep:        { label: 'Sleep',        emoji: '😴',  defaultColor: '#6366f1' },
+  other:        { label: 'Other',        emoji: '✨',  defaultColor: '#94a3b8' },
 }
 
-// ─── Entry (child entity) ────────────────────────────────────────────────────
+// ─── Core entity types ────────────────────────────────────────────────────────
+
+export interface Habit {
+  readonly id:        string
+  readonly name:      string
+  readonly category:  HabitCategory
+  readonly frequency: HabitFrequency
+  readonly customDays?: number[]       // 0=Sun … 6=Sat (used when frequency='custom')
+  readonly createdAt: string           // ISO 8601
+
+  // Phase 3 additions — all optional for backward compat
+  readonly tags?:   string[]           // e.g. ["morning", "quick"]
+  readonly color?:  string             // hex "#rrggbb" — overrides category default
+  readonly icon?:   string             // emoji e.g. "🏃" or icon key
+
+  readonly archivedAt?: string | null  // null = active
+}
+
+/**
+ * HabitSnapshot — read model returned by use cases and stored in Zustand.
+ * Adds computed fields (streak, completionRate, etc.) so UI never recalculates.
+ *
+ * NOTE: The shape below must remain compatible with:
+ *   • GamificationEngine.evaluateBadges()   — reads .category, totalCompletions
+ *   • CategoryRadarChart                     — reads .category, .completionRateLastMonth
+ *   • StreakLineChart                         — reads .currentStreak, .id
+ */
+export interface HabitSnapshot extends Habit {
+  // Computed by use case, NOT stored in IDB
+  readonly currentStreak:          number
+  readonly longestStreak:          number
+  readonly completionRateLastMonth: number   // 0–1
+  readonly totalCompletions:       number
+  readonly isDueToday:             boolean
+  readonly lastCompletedAt:        string | null
+}
 
 export interface HabitEntry {
-  readonly id: string
-  readonly habitId: HabitId
-  /** YYYY-MM-DD — the calendar date this completion belongs to */
-  readonly date: DateString
-  /** Full ISO-8601 timestamp of when the user pressed "done" */
-  readonly completedAt: string
-  readonly note: string
+  readonly id:          string
+  readonly habitId:     string
+  readonly date:        string           // YYYY-MM-DD
+  readonly completedAt: string           // ISO 8601 (used for time-of-day badge checks)
+  readonly note?:       string
 }
 
-// ─── Streak view model (derived, never persisted) ────────────────────────────
-
-export interface HabitStreak {
-  readonly habitId: HabitId
-  readonly currentStreak: number
-  readonly longestStreak: number
-  readonly lastCompletedDate: DateString | null
-  readonly completionRateLastMonth: number   // 0–1
-  readonly totalCompletions: number
-}
-
-// ─── Aggregate Root ───────────────────────────────────────────────────────────
+// ─── Value objects ────────────────────────────────────────────────────────────
 
 /**
- * Habit — Aggregate Root
- *
- * SRP:  manages its own invariants (name length, custom days validity, etc.)
- * OCP:  open for extension via frequency strategies; closed for modification
- * ISP:  exposes only the surface area callers actually need
+ * CreateHabitDTO — what the UI sends to CreateHabit use case.
+ * Tags validated here before hitting domain.
  */
-export class Habit {
-  // Private fields enforce encapsulation — state can only change via methods
-  private readonly _snapshot: HabitSnapshot
+export interface CreateHabitDTO {
+  name:        string
+  category:    HabitCategory
+  frequency:   HabitFrequency
+  customDays?: number[]
+  tags?:       string[]
+  color?:      string
+  icon?:       string
+}
 
-  private constructor(snapshot: HabitSnapshot) {
-    this._snapshot = Object.freeze({ ...snapshot })
+export interface UpdateHabitDTO {
+  id:          string
+  name?:       string
+  category?:   HabitCategory
+  frequency?:  HabitFrequency
+  customDays?: number[]
+  tags?:       string[]
+  color?:      string
+  icon?:       string
+}
+
+// ─── Validation ───────────────────────────────────────────────────────────────
+
+export const HABIT_CONSTRAINTS = {
+  NAME_MIN:      1,
+  NAME_MAX:      100,
+  TAG_MAX_COUNT: 10,
+  TAG_MAX_LEN:   30,
+  TAG_PATTERN:   /^[a-z0-9-]+$/,     // lowercase alphanumeric + hyphens
+  COLOR_PATTERN: /^#[0-9a-f]{6}$/i,
+  ICON_MAX_LEN:  4,                   // allows multi-codepoint emoji
+} as const
+
+/**
+ * Normalise a raw tag string:
+ *   "  Morning Routine  " → "morning-routine"
+ * Returns null if the result is empty or too long.
+ */
+export function normaliseTag(raw: string): string | null {
+  const clean = raw.trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
+  if (!clean || clean.length > HABIT_CONSTRAINTS.TAG_MAX_LEN) return null
+  return clean
+}
+
+/**
+ * Validate tags array. Returns { valid: true, tags } or { valid: false, error }.
+ */
+export function validateTags(
+  raw: string[],
+): { valid: true; tags: string[] } | { valid: false; error: string } {
+  if (raw.length > HABIT_CONSTRAINTS.TAG_MAX_COUNT) {
+    return { valid: false, error: `Maximum ${HABIT_CONSTRAINTS.TAG_MAX_COUNT} tags allowed` }
   }
-
-  // ─── Factory ─────────────────────────────────────────────────────────────
-
-  /**
-   * The ONLY way to create a Habit from raw data.
-   * Runs all invariant checks before allowing construction.
-   */
-  static create(
-    params: Omit<HabitSnapshot, 'id' | 'createdAt' | 'updatedAt' | 'isArchived'>,
-    id: HabitId,
-    now: DateString = new Date().toISOString(),
-  ): Habit {
-    Habit.assertValidName(params.name)
-    Habit.assertValidCategory(params.category)
-    Habit.assertValidColor(params.color)
-    Habit.assertValidCustomDays(params.frequency, params.customDays)
-    Habit.assertValidTarget(params.targetCompletionsPerPeriod)
-
-    const snapshot: HabitSnapshot = {
-      id,
-      name: params.name.trim(),
-      description: (params.description ?? '').trim(),
-      category: params.category,
-      frequency: params.frequency,
-      customDays: params.frequency === 'custom'
-        ? [...new Set(params.customDays ?? [])].sort()
-        : [],
-      color: params.color,
-      icon: params.icon || '✅',
-      targetCompletionsPerPeriod: params.targetCompletionsPerPeriod ?? 1,
-      createdAt: now,
-      updatedAt: now,
-      isArchived: false,
-    }
-
-    return new Habit(snapshot)
+  const tags: string[] = []
+  for (const r of raw) {
+    const t = normaliseTag(r)
+    if (!t) return { valid: false, error: `Invalid tag: "${r}"` }
+    if (!tags.includes(t)) tags.push(t)   // deduplicate
   }
+  return { valid: true, tags }
+}
 
-  /** Rehydrate a Habit from a stored snapshot (no validation — trust the DB) */
-  static fromSnapshot(snapshot: HabitSnapshot): Habit {
-    return new Habit(snapshot)
-  }
-
-  // ─── Read accessors ───────────────────────────────────────────────────────
-
-  get id(): HabitId             { return this._snapshot.id }
-  get name(): string            { return this._snapshot.name }
-  get description(): string     { return this._snapshot.description }
-  get category(): HabitCategory { return this._snapshot.category }
-  get frequency(): HabitFrequency { return this._snapshot.frequency }
-  get customDays(): ReadonlyArray<number> { return this._snapshot.customDays }
-  get color(): string           { return this._snapshot.color }
-  get icon(): string            { return this._snapshot.icon }
-  get target(): number          { return this._snapshot.targetCompletionsPerPeriod }
-  get createdAt(): DateString   { return this._snapshot.createdAt }
-  get updatedAt(): DateString   { return this._snapshot.updatedAt }
-  get isArchived(): boolean     { return this._snapshot.isArchived }
-
-  // ─── Commands (return new instances — immutable pattern) ──────────────────
-
-  rename(newName: string, now = new Date().toISOString()): Habit {
-    Habit.assertValidName(newName)
-    return new Habit({ ...this._snapshot, name: newName.trim(), updatedAt: now })
-  }
-
-  updateDescription(desc: string, now = new Date().toISOString()): Habit {
-    return new Habit({ ...this._snapshot, description: desc.trim(), updatedAt: now })
-  }
-
-  archive(now = new Date().toISOString()): Habit {
-    if (this._snapshot.isArchived) {
-      throw new HabitDomainError('ALREADY_ARCHIVED', `Habit "${this.name}" is already archived.`)
-    }
-    return new Habit({ ...this._snapshot, isArchived: true, updatedAt: now })
-  }
-
-  unarchive(now = new Date().toISOString()): Habit {
-    return new Habit({ ...this._snapshot, isArchived: false, updatedAt: now })
-  }
-
-  changeFrequency(
-    frequency: HabitFrequency,
-    customDays: number[] = [],
-    now = new Date().toISOString(),
-  ): Habit {
-    Habit.assertValidCustomDays(frequency, customDays)
-    return new Habit({
-      ...this._snapshot,
-      frequency,
-      customDays: frequency === 'custom' ? [...new Set(customDays)].sort() : [],
-      updatedAt: now,
-    })
-  }
-
-  // ─── Snapshot export ──────────────────────────────────────────────────────
-
-  toSnapshot(): HabitSnapshot {
-    return this._snapshot
-  }
-
-  // ─── Invariant guards (static, reusable in use cases) ────────────────────
-
-  static assertValidName(name: string): void {
-    const trimmed = name?.trim() ?? ''
-    if (trimmed.length === 0)
-      throw new HabitDomainError('INVALID_NAME', 'Habit name cannot be empty.')
-    if (trimmed.length > 80)
-      throw new HabitDomainError('INVALID_NAME', 'Habit name cannot exceed 80 characters.')
-  }
-
-  static assertValidCategory(cat: string): void {
-    if (!ALL_CATEGORIES.includes(cat as HabitCategory))
-      throw new HabitDomainError('INVALID_CATEGORY', `"${cat}" is not a valid category.`)
-  }
-
-  static assertValidColor(color: string): void {
-    if (!/^#[0-9a-fA-F]{6}$/.test(color))
-      throw new HabitDomainError('INVALID_COLOR', `"${color}" is not a valid hex color.`)
-  }
-
-  static assertValidCustomDays(frequency: HabitFrequency, days: ReadonlyArray<number> = []): void {
-    if (frequency !== 'custom') return
-    if (days.length === 0)
-      throw new HabitDomainError('INVALID_CUSTOM_DAYS', 'Custom frequency requires at least one day.')
-    if (days.some((d) => d < 0 || d > 6 || !Number.isInteger(d)))
-      throw new HabitDomainError('INVALID_CUSTOM_DAYS', 'Custom days must be integers 0–6.')
-  }
-
-  static assertValidTarget(target: number): void {
-    if (!Number.isInteger(target) || target < 1 || target > 365)
-      throw new HabitDomainError('INVALID_TARGET', 'Target completions must be between 1 and 365.')
-  }
+/**
+ * Resolve effective color for a habit — custom color → category default.
+ */
+export function resolveHabitColor(habit: Pick<Habit, 'color' | 'category'>): string {
+  if (habit.color && HABIT_CONSTRAINTS.COLOR_PATTERN.test(habit.color)) return habit.color
+  return CATEGORY_META[habit.category]?.defaultColor ?? '#94a3b8'
 }

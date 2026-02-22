@@ -1,17 +1,50 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html lang="en" class="">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Habit Tracker</title>
-    <!-- Google Fonts: Syne (display) + DM Sans (body) + JetBrains Mono -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+
+    <!-- ── PWA Meta Tags ─────────────────────────────────────────────────── -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#22c55e" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0f172a" media="(prefers-color-scheme: dark)" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Habitual" />
+
+    <!-- ── Apple Touch Icons ─────────────────────────────────────────────── -->
+    <link rel="apple-touch-icon" sizes="152x152" href="/icons/icon-152.png" />
+    <link rel="apple-touch-icon" sizes="192x192" href="/icons/icon-192.png" />
+
+    <!-- ── Favicon ───────────────────────────────────────────────────────── -->
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/icon-96.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/icons/icon-72.png" />
+
+    <!-- ── SEO ───────────────────────────────────────────────────────────── -->
+    <meta name="description" content="Track your daily habits, earn badges, and build unstoppable streaks. Works offline." />
+    <meta name="keywords"    content="habit tracker, daily habits, streak, productivity, offline" />
+
+    <!-- ── Fonts (preconnect for performance) ─────────────────────────────── -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
     <link
-      href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,300&family=JetBrains+Mono:wght@400;500&display=swap"
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Syne:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
+
+    <!-- ── Critical: prevent FOUC on dark mode ────────────────────────────── -->
+    <script>
+      try {
+        const theme = JSON.parse(localStorage.getItem('habit-tracker-ui') ?? '{}').state?.theme
+        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+        if (theme === 'dark' || (theme !== 'light' && prefersDark)) {
+          document.documentElement.classList.add('dark')
+        }
+      } catch {}
+    </script>
+
+    <title>Habitual — Build Better Habits</title>
   </head>
   <body>
     <div id="root"></div>

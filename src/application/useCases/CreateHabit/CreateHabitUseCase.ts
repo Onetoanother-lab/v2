@@ -16,7 +16,7 @@
  *   Input DTO → validate → build Habit aggregate → persist → return output DTO
  */
 
-import { Habit }                       from '@domain/entities/Habit'
+import type { Habit }                  from '@domain/entities/Habit'
 import type { IHabitRepository }       from '@domain/interfaces/repositories'
 import { HabitDomainError }            from '@domain/errors/HabitDomainError'
 import { FrequencyStrategyFactory }    from '@domain/services/FrequencyStrategy'

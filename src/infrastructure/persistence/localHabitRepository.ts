@@ -9,7 +9,7 @@
  * any domain or application layer code.
  */
 
-import { Habit }                    from '@domain/entities/Habit'
+import type { Habit }               from '@domain/entities/Habit'
 import type { HabitSnapshot }       from '@domain/entities/Habit'
 import type { IHabitRepository }    from '@domain/interfaces/repositories'
 import type { HabitId }             from '@domain/types/shared'

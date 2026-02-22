@@ -25,7 +25,7 @@
  * existsByName()          → BY_NAME_LOWER index count  O(log n)
  */
 
-import { Habit }                        from '@domain/entities/Habit'
+import type { Habit }                   from '@/domain/entities/Habit'
 import type { HabitSnapshot }           from '@domain/entities/Habit'
 import type { IHabitRepository }        from '@domain/interfaces/repositories'
 import type { HabitId }                 from '@domain/types/shared'
